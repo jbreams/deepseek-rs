@@ -438,18 +438,19 @@ impl Session {
     }
 
     // ─── Batch prefill ────────────────────────────────────────────────────────
-    /// Process a sequence of prompt tokens in one shot, populating the KV cache
-    /// and returning the logits for the token that would follow.
+    /// Process a sequence of prompt tokens, populating the KV cache and returning
+    /// the logits for the token that would follow.
     ///
-    /// The major matmuls (QKV projections) and the attention kernel run in batch
-    /// over all N tokens; the attention-output projection and FFN still run
-    /// per-token because those paths involve fused HC operations that have no
-    /// batch variant.  For a 512-token prompt this gives a ~10-20× speedup over
-    /// calling `decode` 512 times.
+    /// The prompt is processed in chunks of `raw_cap = N_SWA = 128` tokens.  Within
+    /// each chunk, QKV projections and normalisations run in batch (the main speedup
+    /// vs. sequential `decode_next`).  Attention runs in batch via `prefill_raw` only
+    /// for the first chunk of a fresh session (`pos == 0`); all other chunks use
+    /// per-token `decode_mixed`, which correctly attends to the full circular KV cache
+    /// and all accumulated compressed rows.
     ///
-    /// **Note**: does not run the compressor (ratio=4/128 layers), so the
-    /// compressed KV cache is not populated for prefill tokens.  For prompts
-    /// shorter than `N_SWA=128` this has no quality impact.
+    /// Compressor state is populated for every token.  This method also works
+    /// correctly for multi-turn: calling `prefill` after prior tokens have been
+    /// committed uses per-token attention throughout.
     pub fn prefill(&mut self, engine: &Engine, tokens: &[i32]) -> Result<Vec<f32>> {
         let n = tokens.len();
         anyhow::ensure!(n > 0, "prefill: empty token list");
@@ -459,400 +460,277 @@ impl Session {
             self.n_filled,
             self.ctx_size
         );
-        let start = self.n_filled as u32;
+        let start_pos = self.n_filled;
+        let chunk_size = self.raw_cap; // = N_SWA = 128
 
         let stream = &engine.stream;
 
-        // ── Upload token IDs ──────────────────────────────────────────────
-        let tok_buf: DeviceBuffer<i32> =
-            DeviceBuffer::from_host(stream, tokens).context("prefill: upload tokens")?;
-
-        // ── Allocate batch-sized scratch buffers ──────────────────────────
-        let mut b_hc = DeviceBuffer::<f32>::zeroed(stream, n * HC_DIM).context("b_hc")?;
-        let mut b_hc_next = DeviceBuffer::<f32>::zeroed(stream, n * HC_DIM).context("b_hc_next")?;
-        let mut b_flat_hc = DeviceBuffer::<f32>::zeroed(stream, n * HC_DIM).context("b_flat_hc")?;
-        let mut b_hc_mix = DeviceBuffer::<f32>::zeroed(stream, n * MIX_HC).context("b_hc_mix")?;
-        let b_hc_split = DeviceBuffer::<f32>::zeroed(stream, n * MIX_HC).context("b_hc_split")?;
-        let mut b_attn_cur =
-            DeviceBuffer::<f32>::zeroed(stream, n * N_EMBD).context("b_attn_cur")?;
-        let mut b_attn_norm =
-            DeviceBuffer::<f32>::zeroed(stream, n * N_EMBD).context("b_attn_norm")?;
-        // xq scratch: large enough for max(N_EMBD, Q_RANK) * n rows
-        let max_xq = n * Q_DIM; // worst case (heads group-quantize)
-        let max_xs = n * (Q_DIM / 32);
-        let mut b_xq_i8 = DeviceBuffer::<i8>::zeroed(stream, max_xq).context("b_xq_i8")?;
+        // Allocate batch scratch buffers sized for one chunk (≤ chunk_size tokens).
+        // Using chunk_size rather than n avoids large allocations for long prompts.
+        let nc_max = n.min(chunk_size);
+        let mut b_hc      = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_hc")?;
+        let mut b_hc_next = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_hc_next")?;
+        let mut b_flat_hc = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_flat_hc")?;
+        let mut b_hc_mix  = DeviceBuffer::<f32>::zeroed(stream, nc_max * MIX_HC).context("b_hc_mix")?;
+        let b_hc_split    = DeviceBuffer::<f32>::zeroed(stream, nc_max * MIX_HC).context("b_hc_split")?;
+        let mut b_attn_cur  = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_EMBD).context("b_attn_cur")?;
+        let mut b_attn_norm = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_EMBD).context("b_attn_norm")?;
+        let max_xq = nc_max * Q_DIM;
+        let max_xs = nc_max * (Q_DIM / 32);
+        let mut b_xq_i8  = DeviceBuffer::<i8>::zeroed(stream, max_xq).context("b_xq_i8")?;
         let mut b_xscale = DeviceBuffer::<f32>::zeroed(stream, max_xs).context("b_xscale")?;
-        let mut b_qr = DeviceBuffer::<f32>::zeroed(stream, n * Q_RANK).context("b_qr")?;
-        let mut b_qr_norm = DeviceBuffer::<f32>::zeroed(stream, n * Q_RANK).context("b_qr_norm")?;
-        let mut b_q = DeviceBuffer::<f32>::zeroed(stream, n * Q_DIM).context("b_q")?;
-        let mut b_kv_raw =
-            DeviceBuffer::<f32>::zeroed(stream, n * N_HEAD_DIM).context("b_kv_raw")?;
-        let mut b_kv = DeviceBuffer::<f32>::zeroed(stream, n * N_HEAD_DIM).context("b_kv")?;
-        let mut b_heads = DeviceBuffer::<f32>::zeroed(stream, n * Q_DIM).context("b_heads")?;
+        let mut b_qr     = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_RANK).context("b_qr")?;
+        let mut b_qr_norm= DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_RANK).context("b_qr_norm")?;
+        let mut b_q      = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_DIM).context("b_q")?;
+        let mut b_kv_raw = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_HEAD_DIM).context("b_kv_raw")?;
+        let mut b_kv     = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_HEAD_DIM).context("b_kv")?;
+        // b_heads only used when batch_attn == true (first fresh chunk)
+        let mut b_heads  = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_DIM).context("b_heads")?;
 
-        // ── 1. Embed all tokens → b_hc ────────────────────────────────────
-        {
-            let w_embd = upload(engine, &engine.weights.token_embd, "token_embd")?;
-            engine.kernels.embed.embed_tokens_hc(
-                stream,
-                Engine::cfg1d(n * HC_DIM, 256),
-                &tok_buf,
-                buf_as_u16(&w_embd),
-                &mut b_hc,
-                N_VOCAB as u32,
-                n as u32,
-                N_EMBD as u32,
-                N_HC as u32,
-            )?;
+        let mut processed = 0usize;
+
+        while processed < n {
+            let nc = chunk_size.min(n - processed);
+            let abs_start = (start_pos + processed) as u32;
+            // Use batch prefill_raw attention only for the very first chunk of a
+            // fresh session.  Any other chunk (including multi-turn continuations)
+            // uses per-token decode_mixed, which correctly handles the circular KV
+            // cache and all accumulated comp rows.
+            let batch_attn = abs_start == 0;
+            let chunk_tokens = &tokens[processed..processed + nc];
+
+            // Upload this chunk's token IDs to GPU.
+            let tok_buf: DeviceBuffer<i32> =
+                DeviceBuffer::from_host(stream, chunk_tokens).context("prefill: upload tokens")?;
+
+            // ── 1. Embed chunk tokens → b_hc ──────────────────────────────────
+            {
+                let w_embd = upload(engine, &engine.weights.token_embd, "token_embd")?;
+                engine.kernels.embed.embed_tokens_hc(
+                    stream,
+                    Engine::cfg1d(nc * HC_DIM, 256),
+                    &tok_buf,
+                    buf_as_u16(&w_embd),
+                    &mut b_hc,
+                    N_VOCAB as u32, nc as u32, N_EMBD as u32, N_HC as u32,
+                )?;
+            }
+
+            // ── 2. Layer loop ──────────────────────────────────────────────────
+            for il in 0..N_LAYER {
+                let lw = &engine.weights.layers[il];
+                let ratio = compress_ratio(il);
+                let blocks_embd  = (N_EMBD  / 32) as u64;
+                let blocks_qrank = (Q_RANK  / 32) as u64;
+
+                // ── a. Batch HC attn pre-norm ──────────────────────────────────
+                engine.kernels.norm.rms_norm_plain(
+                    stream,
+                    LaunchConfig { grid_dim: (nc as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                    &b_hc, &mut b_flat_hc, HC_DIM as u32, nc as u32, RMS_EPS,
+                )?;
+                {
+                    let w_fn = upload(engine, &lw.hc_attn_fn, &format!("blk.{il}.hc_attn_fn"))?;
+                    engine.kernels.matmul.matmul_f16(
+                        stream,
+                        LaunchConfig { grid_dim: (MIX_HC as u32, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        buf_as_u16(&w_fn), &b_flat_hc, &mut b_hc_mix,
+                        HC_DIM as u64, MIX_HC as u64, nc as u64,
+                    )?;
+                }
+                {
+                    let w_scale = upload(engine, &lw.hc_attn_scale, &format!("blk.{il}.hc_attn_scale"))?;
+                    let w_base  = upload(engine, &lw.hc_attn_base,  &format!("blk.{il}.hc_attn_base"))?;
+                    let w_norm  = upload(engine, &lw.attn_norm,     &format!("blk.{il}.attn_norm"))?;
+                    engine.kernels.hc.hc_split_weighted_sum_norm_fused(
+                        stream,
+                        LaunchConfig { grid_dim: (nc as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        &b_hc_mix, buf_as_f32(&w_scale), buf_as_f32(&w_base),
+                        &b_hc, buf_as_f32(&w_norm),
+                        b_hc_split.cu_deviceptr() as *mut f32,
+                        &mut b_attn_cur, &mut b_attn_norm,
+                        N_EMBD as u32, N_HC as u32, nc as u32,
+                        N_HC_SINKHORN_ITER as u32, HC_EPS, RMS_EPS,
+                    )?;
+                }
+
+                // ── b. Batch QKV projections ───────────────────────────────────
+                engine.kernels.quantize.quantize_q8_0(
+                    stream,
+                    LaunchConfig { grid_dim: (blocks_embd as u32, nc as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
+                    &b_attn_norm, &mut b_xq_i8, &mut b_xscale, N_EMBD as u64, blocks_embd,
+                )?;
+                {
+                    let w_qa = upload(engine, &lw.attn_q_a, &format!("blk.{il}.attn_q_a"))?;
+                    engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
+                        stream,
+                        LaunchConfig { grid_dim: ((Q_RANK as u32 + 7) / 8, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        &w_qa, &b_xq_i8, &b_xscale, &mut b_qr,
+                        N_EMBD as u64, Q_RANK as u64, nc as u64, blocks_embd,
+                    )?;
+                }
+                {
+                    let w_kv = upload(engine, &lw.attn_kv, &format!("blk.{il}.attn_kv_a_mla"))?;
+                    engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
+                        stream,
+                        LaunchConfig { grid_dim: ((N_HEAD_DIM as u32 + 7) / 8, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        &w_kv, &b_xq_i8, &b_xscale, &mut b_kv_raw,
+                        N_EMBD as u64, N_HEAD_DIM as u64, nc as u64, blocks_embd,
+                    )?;
+                }
+                {
+                    let w_qa_norm = upload(engine, &lw.attn_q_a_norm, &format!("blk.{il}.attn_q_a_norm"))?;
+                    let w_kv_norm = upload(engine, &lw.attn_kv_a_norm, &format!("blk.{il}.attn_kv_a_norm"))?;
+                    engine.kernels.norm.dsv4_qkv_rms_norm_rows(
+                        stream,
+                        LaunchConfig { grid_dim: (nc as u32, 2, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        &b_qr, buf_as_f32(&w_qa_norm), &mut b_qr_norm, Q_RANK as u32,
+                        &b_kv_raw, buf_as_f32(&w_kv_norm), &mut b_kv, N_HEAD_DIM as u32,
+                        nc as u32, RMS_EPS,
+                    )?;
+                }
+                engine.kernels.quantize.quantize_q8_0(
+                    stream,
+                    LaunchConfig { grid_dim: (blocks_qrank as u32, nc as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
+                    &b_qr_norm, &mut b_xq_i8, &mut b_xscale, Q_RANK as u64, blocks_qrank,
+                )?;
+                {
+                    let w_qb = upload(engine, &lw.attn_q_b, &format!("blk.{il}.attn_q_b"))?;
+                    engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
+                        stream,
+                        LaunchConfig { grid_dim: ((Q_DIM as u32 + 7) / 8, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        &w_qb, &b_xq_i8, &b_xscale, &mut b_q,
+                        Q_RANK as u64, Q_DIM as u64, nc as u64, blocks_qrank,
+                    )?;
+                }
+                engine.kernels.norm.head_rms_norm(
+                    stream,
+                    LaunchConfig { grid_dim: (nc as u32 * N_HEAD as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                    &mut b_q, nc as u32, N_HEAD as u32, N_HEAD_DIM as u32, RMS_EPS,
+                )?;
+                let fs = rope_freq_scale(il); let fa = rope_attn_factor(il, fs);
+                engine.kernels.rope.rope_tail(
+                    stream, Engine::cfg1d(nc * N_HEAD * (N_ROT / 2), 256),
+                    &mut b_q, nc as u32, N_HEAD as u32, N_HEAD_DIM as u32, N_ROT as u32,
+                    abs_start, ROPE_ORIG_CTX, 0, rope_freq_base(il), fs, rope_ext_factor(il), fa,
+                    ROPE_YARN_BETA_FAST, ROPE_YARN_BETA_SLOW,
+                )?;
+                engine.kernels.rope.rope_tail(
+                    stream, Engine::cfg1d(nc * N_HEAD_KV * (N_ROT / 2), 256),
+                    &mut b_kv, nc as u32, N_HEAD_KV as u32, N_HEAD_DIM as u32, N_ROT as u32,
+                    abs_start, ROPE_ORIG_CTX, 0, rope_freq_base(il), fs, rope_ext_factor(il), fa,
+                    ROPE_YARN_BETA_FAST, ROPE_YARN_BETA_SLOW,
+                )?;
+
+                // ── c. Store KV entries at positions abs_start..abs_start+nc-1 ─
+                engine.kernels.kv_cache.store_raw_kv_batch(
+                    stream, Engine::cfg1d(nc * N_HEAD_DIM, 256),
+                    &b_kv, &mut self.raw_cache[il],
+                    self.raw_cap as u32, abs_start, nc as u32, N_HEAD_DIM as u32,
+                )?;
+
+                // ── d. Batch attention (first fresh chunk only) ─────────────────
+                if batch_attn {
+                    let sinks_buf = upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
+                    engine.kernels.attention.prefill_raw(
+                        stream,
+                        LaunchConfig { grid_dim: (nc as u32, N_HEAD as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                        &b_q, &self.raw_cache[il], buf_as_f32(&sinks_buf), &mut b_heads,
+                        nc as u32, self.raw_cap as u32, N_HEAD as u32, N_HEAD_DIM as u32,
+                    )?;
+                }
+
+                // ── e-i. Per-token: compressors + attention (if not batch) + FFN ─
+                let f32_size = std::mem::size_of::<f32>() as u64;
+                for t in 0..nc {
+                    let pos_t = abs_start + t as u32;
+                    unsafe {
+                        // b_hc[t] → self.cur_hc
+                        cuda_core::memory::memcpy_dtod_async(
+                            self.cur_hc.cu_deviceptr(),
+                            b_hc.cu_deviceptr() + (t * HC_DIM) as u64 * f32_size,
+                            HC_DIM * 4, stream.cu_stream(),
+                        )?;
+                        // b_hc_split[t] → self.hc_split
+                        cuda_core::memory::memcpy_dtod_async(
+                            self.hc_split.cu_deviceptr(),
+                            b_hc_split.cu_deviceptr() + (t * MIX_HC) as u64 * f32_size,
+                            MIX_HC * 4, stream.cu_stream(),
+                        )?;
+                        // b_attn_norm[t] → self.attn_norm (needed by compressors)
+                        cuda_core::memory::memcpy_dtod_async(
+                            self.attn_norm.cu_deviceptr(),
+                            b_attn_norm.cu_deviceptr() + (t * N_EMBD) as u64 * f32_size,
+                            N_EMBD * 4, stream.cu_stream(),
+                        )?;
+                    }
+
+                    // Compressors — must run before attention to match decode_layer ordering.
+                    if ratio == 4 { self.run_index_compressor_step(engine, il, pos_t)?; }
+                    self.run_attn_compressor_step(engine, il, pos_t)?;
+
+                    // Attention for this token.
+                    if batch_attn {
+                        // Use the precomputed batch result.
+                        unsafe {
+                            cuda_core::memory::memcpy_dtod_async(
+                                self.heads.cu_deviceptr(),
+                                b_heads.cu_deviceptr() + (t * Q_DIM) as u64 * f32_size,
+                                Q_DIM * 4, stream.cu_stream(),
+                            )?;
+                        }
+                    } else {
+                        // Per-token decode_mixed: correct for circular raw cache and comp rows.
+                        unsafe {
+                            cuda_core::memory::memcpy_dtod_async(
+                                self.q.cu_deviceptr(),
+                                b_q.cu_deviceptr() + (t * Q_DIM) as u64 * f32_size,
+                                Q_DIM * 4, stream.cu_stream(),
+                            )?;
+                        }
+                        let n_comp = if ratio != 0 { self.layer_n_comp[il] } else { 0 };
+                        let n_raw = if pos_t + 1 < self.raw_cap as u32 { pos_t + 1 } else { self.raw_cap as u32 };
+                        let raw_start = (pos_t + 1).wrapping_sub(n_raw) % self.raw_cap as u32;
+                        let sinks_buf = upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
+                        engine.kernels.attention.decode_mixed(
+                            stream,
+                            LaunchConfig { grid_dim: (1, N_HEAD as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                            &self.q,
+                            &self.raw_cache[il],
+                            &self.attn_comp_cache[il],
+                            &self.attn_comp_cache[il],
+                            buf_as_f32(&sinks_buf),
+                            &mut self.heads,
+                            0, 1, pos_t, n_raw, self.raw_cap as u32, raw_start,
+                            n_comp, N_SWA as u32, ratio, N_HEAD as u32, N_HEAD_DIM as u32,
+                        )?;
+                    }
+
+                    self.decode_attn_out_and_ffn(engine, il, pos_t, ratio, chunk_tokens[t])?;
+
+                    // self.cur_hc → b_hc_next[t]
+                    unsafe {
+                        cuda_core::memory::memcpy_dtod_async(
+                            b_hc_next.cu_deviceptr() + (t * HC_DIM) as u64 * f32_size,
+                            self.cur_hc.cu_deviceptr(),
+                            HC_DIM * 4, stream.cu_stream(),
+                        )?;
+                    }
+                }
+
+                std::mem::swap(&mut b_hc, &mut b_hc_next);
+            }
+
+            processed += nc;
         }
 
-        // ── 2. Layer loop ─────────────────────────────────────────────────
-        for il in 0..N_LAYER {
-            let lw = &engine.weights.layers[il];
-            let ratio = compress_ratio(il);
-            let blocks_embd = (N_EMBD / 32) as u64;
-            let blocks_qrank = (Q_RANK / 32) as u64;
-
-            // ── a. Batch HC attn pre-norm ─────────────────────────────────
-            engine.kernels.norm.rms_norm_plain(
-                stream,
-                LaunchConfig {
-                    grid_dim: (n as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &b_hc,
-                &mut b_flat_hc,
-                HC_DIM as u32,
-                n as u32,
-                RMS_EPS,
-            )?;
-            {
-                let w_fn = upload(engine, &lw.hc_attn_fn, &format!("blk.{il}.hc_attn_fn"))?;
-                engine.kernels.matmul.matmul_f16(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (MIX_HC as u32, n as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    buf_as_u16(&w_fn),
-                    &b_flat_hc,
-                    &mut b_hc_mix,
-                    HC_DIM as u64,
-                    MIX_HC as u64,
-                    n as u64,
-                )?;
-            }
-            {
-                let w_scale = upload(
-                    engine,
-                    &lw.hc_attn_scale,
-                    &format!("blk.{il}.hc_attn_scale"),
-                )?;
-                let w_base = upload(engine, &lw.hc_attn_base, &format!("blk.{il}.hc_attn_base"))?;
-                let w_norm = upload(engine, &lw.attn_norm, &format!("blk.{il}.attn_norm"))?;
-                engine.kernels.hc.hc_split_weighted_sum_norm_fused(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (n as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &b_hc_mix,
-                    buf_as_f32(&w_scale),
-                    buf_as_f32(&w_base),
-                    &b_hc,
-                    buf_as_f32(&w_norm),
-                    b_hc_split.cu_deviceptr() as *mut f32,
-                    &mut b_attn_cur,
-                    &mut b_attn_norm,
-                    N_EMBD as u32,
-                    N_HC as u32,
-                    n as u32,
-                    N_HC_SINKHORN_ITER as u32,
-                    HC_EPS,
-                    RMS_EPS,
-                )?;
-            }
-
-            // ── b. Batch QKV projections ──────────────────────────────────
-            // Quantize attn_norm for all tokens
-            engine.kernels.quantize.quantize_q8_0(
-                stream,
-                LaunchConfig {
-                    grid_dim: (blocks_embd as u32, n as u32, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &b_attn_norm,
-                &mut b_xq_i8,
-                &mut b_xscale,
-                N_EMBD as u64,
-                blocks_embd,
-            )?;
-            // qr ← attn_norm × W_qa
-            {
-                let w_qa = upload(engine, &lw.attn_q_a, &format!("blk.{il}.attn_q_a"))?;
-                engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: ((Q_RANK as u32 + 7) / 8, n as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &w_qa,
-                    &b_xq_i8,
-                    &b_xscale,
-                    &mut b_qr,
-                    N_EMBD as u64,
-                    Q_RANK as u64,
-                    n as u64,
-                    blocks_embd,
-                )?;
-            }
-            // kv_raw ← attn_norm × W_kv
-            {
-                let w_kv = upload(engine, &lw.attn_kv, &format!("blk.{il}.attn_kv_a_mla"))?;
-                engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: ((N_HEAD_DIM as u32 + 7) / 8, n as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &w_kv,
-                    &b_xq_i8,
-                    &b_xscale,
-                    &mut b_kv_raw,
-                    N_EMBD as u64,
-                    N_HEAD_DIM as u64,
-                    n as u64,
-                    blocks_embd,
-                )?;
-            }
-            // Batch RMS norm: qr_norm ← rms_norm(qr, W_qa_norm), kv ← rms_norm(kv_raw, W_kv_norm)
-            {
-                let w_qa_norm = upload(
-                    engine,
-                    &lw.attn_q_a_norm,
-                    &format!("blk.{il}.attn_q_a_norm"),
-                )?;
-                let w_kv_norm = upload(
-                    engine,
-                    &lw.attn_kv_a_norm,
-                    &format!("blk.{il}.attn_kv_a_norm"),
-                )?;
-                engine.kernels.norm.dsv4_qkv_rms_norm_rows(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (n as u32, 2, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &b_qr,
-                    buf_as_f32(&w_qa_norm),
-                    &mut b_qr_norm,
-                    Q_RANK as u32,
-                    &b_kv_raw,
-                    buf_as_f32(&w_kv_norm),
-                    &mut b_kv,
-                    N_HEAD_DIM as u32,
-                    n as u32,
-                    RMS_EPS,
-                )?;
-            }
-            // Quantize qr_norm, expand to q
-            engine.kernels.quantize.quantize_q8_0(
-                stream,
-                LaunchConfig {
-                    grid_dim: (blocks_qrank as u32, n as u32, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &b_qr_norm,
-                &mut b_xq_i8,
-                &mut b_xscale,
-                Q_RANK as u64,
-                blocks_qrank,
-            )?;
-            {
-                let w_qb = upload(engine, &lw.attn_q_b, &format!("blk.{il}.attn_q_b"))?;
-                engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: ((Q_DIM as u32 + 7) / 8, n as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &w_qb,
-                    &b_xq_i8,
-                    &b_xscale,
-                    &mut b_q,
-                    Q_RANK as u64,
-                    Q_DIM as u64,
-                    n as u64,
-                    blocks_qrank,
-                )?;
-            }
-            // Batch head RMS norm and RoPE on Q
-            engine.kernels.norm.head_rms_norm(
-                stream,
-                LaunchConfig {
-                    grid_dim: (n as u32 * N_HEAD as u32, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &mut b_q,
-                n as u32,
-                N_HEAD as u32,
-                N_HEAD_DIM as u32,
-                RMS_EPS,
-            )?;
-            let fs = rope_freq_scale(il);
-            let fa = rope_attn_factor(il, fs);
-            engine.kernels.rope.rope_tail(
-                stream,
-                Engine::cfg1d(n * N_HEAD * (N_ROT / 2), 256),
-                &mut b_q,
-                n as u32,
-                N_HEAD as u32,
-                N_HEAD_DIM as u32,
-                N_ROT as u32,
-                start,
-                ROPE_ORIG_CTX,
-                0,
-                rope_freq_base(il),
-                fs,
-                rope_ext_factor(il),
-                fa,
-                ROPE_YARN_BETA_FAST,
-                ROPE_YARN_BETA_SLOW,
-            )?;
-            // RoPE on KV
-            engine.kernels.rope.rope_tail(
-                stream,
-                Engine::cfg1d(n * N_HEAD_KV * (N_ROT / 2), 256),
-                &mut b_kv,
-                n as u32,
-                N_HEAD_KV as u32,
-                N_HEAD_DIM as u32,
-                N_ROT as u32,
-                start,
-                ROPE_ORIG_CTX,
-                0,
-                rope_freq_base(il),
-                fs,
-                rope_ext_factor(il),
-                fa,
-                ROPE_YARN_BETA_FAST,
-                ROPE_YARN_BETA_SLOW,
-            )?;
-
-            // ── c. Store N KV entries at positions start..start+N-1 ───────
-            engine.kernels.kv_cache.store_raw_kv_batch(
-                stream,
-                Engine::cfg1d(n * N_HEAD_DIM, 256),
-                &b_kv,
-                &mut self.raw_cache[il],
-                self.raw_cap as u32,
-                start,
-                n as u32,
-                N_HEAD_DIM as u32,
-            )?;
-            // (Raw KV cache populated above; compressor steps run per-token below.)
-
-            // ── d. Batch prefill attention ────────────────────────────────
-            {
-                let sinks_buf = upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
-                engine.kernels.attention.prefill_raw(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (n as u32, N_HEAD as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &b_q,
-                    &self.raw_cache[il],
-                    buf_as_f32(&sinks_buf),
-                    &mut b_heads,
-                    n as u32,
-                    self.raw_cap as u32,
-                    N_HEAD as u32,
-                    N_HEAD_DIM as u32,
-                )?;
-            }
-
-            // ── e-i. Per-token: output proj + FFN ─────────────────────────
-            // Each token's HC state and split are independent; copy them to the
-            // single-token session buffers, run the existing path, copy back.
-            let f32_size = std::mem::size_of::<f32>() as u64;
-            for t in 0..n {
-                let pos_t = start + t as u32;
-                unsafe {
-                    // heads[t] → self.heads
-                    cuda_core::memory::memcpy_dtod_async(
-                        self.heads.cu_deviceptr(),
-                        b_heads.cu_deviceptr() + (t * Q_DIM) as u64 * f32_size,
-                        Q_DIM as usize * 4,
-                        stream.cu_stream(),
-                    )?;
-                    // b_hc[t] → self.cur_hc
-                    cuda_core::memory::memcpy_dtod_async(
-                        self.cur_hc.cu_deviceptr(),
-                        b_hc.cu_deviceptr() + (t * HC_DIM) as u64 * f32_size,
-                        HC_DIM as usize * 4,
-                        stream.cu_stream(),
-                    )?;
-                    // b_hc_split[t] → self.hc_split
-                    cuda_core::memory::memcpy_dtod_async(
-                        self.hc_split.cu_deviceptr(),
-                        b_hc_split.cu_deviceptr() + (t * MIX_HC) as u64 * f32_size,
-                        MIX_HC as usize * 4,
-                        stream.cu_stream(),
-                    )?;
-                    // b_attn_norm[t] → self.attn_norm (needed by compressor, harmless otherwise)
-                    cuda_core::memory::memcpy_dtod_async(
-                        self.attn_norm.cu_deviceptr(),
-                        b_attn_norm.cu_deviceptr() + (t * N_EMBD) as u64 * f32_size,
-                        N_EMBD as usize * 4,
-                        stream.cu_stream(),
-                    )?;
-                }
-
-                // Run compressor steps for this position (populates comp caches for future decodes).
-                if ratio == 4 {
-                    self.run_index_compressor_step(engine, il, pos_t)?;
-                }
-                self.run_attn_compressor_step(engine, il, pos_t)?;
-
-                self.decode_attn_out_and_ffn(engine, il, pos_t, ratio, tokens[t])?;
-
-                // self.cur_hc now holds this token's updated HC → store to b_hc_next[t]
-                unsafe {
-                    cuda_core::memory::memcpy_dtod_async(
-                        b_hc_next.cu_deviceptr() + (t * HC_DIM) as u64 * f32_size,
-                        self.cur_hc.cu_deviceptr(),
-                        HC_DIM as usize * 4,
-                        stream.cu_stream(),
-                    )?;
-                }
-            }
-
-            // b_hc_next is the input for the next layer
-            std::mem::swap(&mut b_hc, &mut b_hc_next);
-        }
-
-        // After all layers: self.cur_hc holds the last token's updated HC.
-        // Run output projection for the last token's position.
-        self.decode_output(engine, start + (n - 1) as u32)?;
-
+        // After all chunks: self.cur_hc holds the last token's HC state (output of
+        // the final layer), ready for decode_output.
+        let last_pos = (start_pos + n - 1) as u32;
+        self.decode_output(engine, last_pos)?;
         self.n_filled += n;
 
-        let logits = self
-            .logits_buf
-            .to_host_vec(stream)
-            .context("prefill: copying logits")?;
+        let logits = self.logits_buf.to_host_vec(stream).context("prefill: copying logits")?;
         Ok(logits)
     }
 

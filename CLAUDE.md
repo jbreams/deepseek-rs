@@ -96,11 +96,11 @@ sess.prefill(&engine, &tokens)?;     // batch; fast for the first turn
 sess.pos()                           // current fill level
 ```
 
-`decode_next` is correct for all turns including multi-turn (attends to full KV history).
-`prefill` is correct for KV storage and RoPE (uses `n_filled` as start_pos) but the
-batch attention kernel (`prefill_raw`) only attends within the current batch, not to
-prior-turn KV entries.  For this reason the chat binary uses `decode_next` for all
-tokens after the initial BOS.  Turn 2+ user tokens are always fed via `decode_next`.
+`decode_next` and `prefill` are both correct for all turns including multi-turn.
+`prefill` processes in chunks of `raw_cap=128`; only the very first chunk of a fresh
+session uses fast batch `prefill_raw` for attention — all other chunks use per-token
+`decode_mixed` which attends to the full KV history.  The chat binary uses
+`decode_next` for per-turn tokens purely for simplicity; `prefill` would also work.
 
 ## Compressor and indexer
 
@@ -163,9 +163,13 @@ that loads once.  Do not split it into multiple `#[test]` fns.
 
 ## Known limitations
 
-**`prefill_raw` does not attend to prior-turn KV** — The batch attention kernel only
-sees the current batch.  Multi-turn correctness requires feeding subsequent turns via
-sequential `decode_next` calls, which the chat binary does.
+**`prefill_raw` batch attention is only used for the very first chunk** — The
+`prefill` method processes long prompts in chunks of `raw_cap = N_SWA = 128` tokens.
+Only the first chunk of a fresh session (`abs_start == 0`) uses batch `prefill_raw`
+(fast, but sees only the current batch).  All other chunks — including multi-turn
+continuations and chunk 2+ of long prompts — use per-token `decode_mixed`, which is
+correct but sequential for the attention step.  QKV projections remain batched across
+all tokens within each chunk.
 
 ## Chat template tokens
 
