@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 /// Session: allocates GPU scratch buffers and runs single-token decode.
 ///
 /// Full implementation: sliding-window attention for ratio=0 layers,
@@ -26,7 +25,6 @@ const ROPE_YARN_BETA_FAST: f32 = 32.0;
 const ROPE_YARN_BETA_SLOW: f32 = 1.0;
 const COMPRESS_ROPE_FREQ_BASE: f32 = 160000.0;
 const ROPE_ORIG_CTX: u32 = 65536;
-const EXPERT_WEIGHT_SCALE: f32 = 1.5;
 
 // ─── Scalar dimension constants ──────────────────────────────────────────────
 const HC_DIM: usize = N_HC * N_EMBD; // 16384
@@ -106,7 +104,6 @@ pub struct Session {
     routed_up: DeviceBuffer<f32>,       // [N_EXPERT_USED * N_FF_EXP]
     routed_mid: DeviceBuffer<f32>,      // [N_EXPERT_USED * N_FF_EXP]
     routed_out: DeviceBuffer<f32>,      // [N_EXPERT_USED * N_EMBD = 24576]
-    ffn_out: DeviceBuffer<f32>,         // [HC_DIM]
     after_ffn_hc: DeviceBuffer<f32>,    // [HC_DIM]
     output_weights: DeviceBuffer<f32>,  // [N_HC=4]
     output_embd: DeviceBuffer<f32>,     // [N_EMBD]
@@ -166,9 +163,6 @@ fn buf_as_f32(b: &DeviceBuffer<u8>) -> &DeviceBuffer<f32> {
 }
 fn buf_as_u16(b: &DeviceBuffer<u8>) -> &DeviceBuffer<u16> {
     unsafe { &*(b as *const DeviceBuffer<u8> as *const DeviceBuffer<u16>) }
-}
-fn buf_as_i8(b: &DeviceBuffer<u8>) -> &DeviceBuffer<i8> {
-    unsafe { &*(b as *const DeviceBuffer<u8> as *const DeviceBuffer<i8>) }
 }
 fn buf_as_i32(b: &DeviceBuffer<u8>) -> &DeviceBuffer<i32> {
     unsafe { &*(b as *const DeviceBuffer<u8> as *const DeviceBuffer<i32>) }
@@ -239,7 +233,6 @@ impl Session {
         let routed_up = zbuf!(f32, N_EXPERT_USED * N_FF_EXP);
         let routed_mid = zbuf!(f32, N_EXPERT_USED * N_FF_EXP);
         let routed_out = zbuf!(f32, N_EXPERT_USED * N_EMBD);
-        let ffn_out = zbuf!(f32, HC_DIM);
         let after_ffn_hc = zbuf!(f32, HC_DIM);
         let output_weights = zbuf!(f32, N_HC);
         let output_embd = zbuf!(f32, N_EMBD);
@@ -353,7 +346,6 @@ impl Session {
             routed_up,
             routed_mid,
             routed_out,
-            ffn_out,
             after_ffn_hc,
             output_weights,
             output_embd,
@@ -468,24 +460,32 @@ impl Session {
         // Allocate batch scratch buffers sized for one chunk (≤ chunk_size tokens).
         // Using chunk_size rather than n avoids large allocations for long prompts.
         let nc_max = n.min(chunk_size);
-        let mut b_hc      = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_hc")?;
-        let mut b_hc_next = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_hc_next")?;
-        let mut b_flat_hc = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_flat_hc")?;
-        let mut b_hc_mix  = DeviceBuffer::<f32>::zeroed(stream, nc_max * MIX_HC).context("b_hc_mix")?;
-        let b_hc_split    = DeviceBuffer::<f32>::zeroed(stream, nc_max * MIX_HC).context("b_hc_split")?;
-        let mut b_attn_cur  = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_EMBD).context("b_attn_cur")?;
-        let mut b_attn_norm = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_EMBD).context("b_attn_norm")?;
+        let mut b_hc = DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_hc")?;
+        let mut b_hc_next =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_hc_next")?;
+        let mut b_flat_hc =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * HC_DIM).context("b_flat_hc")?;
+        let mut b_hc_mix =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * MIX_HC).context("b_hc_mix")?;
+        let b_hc_split =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * MIX_HC).context("b_hc_split")?;
+        let mut b_attn_cur =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * N_EMBD).context("b_attn_cur")?;
+        let mut b_attn_norm =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * N_EMBD).context("b_attn_norm")?;
         let max_xq = nc_max * Q_DIM;
         let max_xs = nc_max * (Q_DIM / 32);
-        let mut b_xq_i8  = DeviceBuffer::<i8>::zeroed(stream, max_xq).context("b_xq_i8")?;
+        let mut b_xq_i8 = DeviceBuffer::<i8>::zeroed(stream, max_xq).context("b_xq_i8")?;
         let mut b_xscale = DeviceBuffer::<f32>::zeroed(stream, max_xs).context("b_xscale")?;
-        let mut b_qr     = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_RANK).context("b_qr")?;
-        let mut b_qr_norm= DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_RANK).context("b_qr_norm")?;
-        let mut b_q      = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_DIM).context("b_q")?;
-        let mut b_kv_raw = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_HEAD_DIM).context("b_kv_raw")?;
-        let mut b_kv     = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_HEAD_DIM).context("b_kv")?;
+        let mut b_qr = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_RANK).context("b_qr")?;
+        let mut b_qr_norm =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_RANK).context("b_qr_norm")?;
+        let mut b_q = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_DIM).context("b_q")?;
+        let mut b_kv_raw =
+            DeviceBuffer::<f32>::zeroed(stream, nc_max * N_HEAD_DIM).context("b_kv_raw")?;
+        let mut b_kv = DeviceBuffer::<f32>::zeroed(stream, nc_max * N_HEAD_DIM).context("b_kv")?;
         // b_heads only used when batch_attn == true (first fresh chunk)
-        let mut b_heads  = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_DIM).context("b_heads")?;
+        let mut b_heads = DeviceBuffer::<f32>::zeroed(stream, nc_max * Q_DIM).context("b_heads")?;
 
         let mut processed = 0usize;
 
@@ -512,7 +512,10 @@ impl Session {
                     &tok_buf,
                     buf_as_u16(&w_embd),
                     &mut b_hc,
-                    N_VOCAB as u32, nc as u32, N_EMBD as u32, N_HC as u32,
+                    N_VOCAB as u32,
+                    nc as u32,
+                    N_EMBD as u32,
+                    N_HC as u32,
                 )?;
             }
 
@@ -520,123 +523,270 @@ impl Session {
             for il in 0..N_LAYER {
                 let lw = &engine.weights.layers[il];
                 let ratio = compress_ratio(il);
-                let blocks_embd  = (N_EMBD  / 32) as u64;
-                let blocks_qrank = (Q_RANK  / 32) as u64;
+                let blocks_embd = (N_EMBD / 32) as u64;
+                let blocks_qrank = (Q_RANK / 32) as u64;
 
                 // ── a. Batch HC attn pre-norm ──────────────────────────────────
                 engine.kernels.norm.rms_norm_plain(
                     stream,
-                    LaunchConfig { grid_dim: (nc as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                    &b_hc, &mut b_flat_hc, HC_DIM as u32, nc as u32, RMS_EPS,
+                    LaunchConfig {
+                        grid_dim: (nc as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &b_hc,
+                    &mut b_flat_hc,
+                    HC_DIM as u32,
+                    nc as u32,
+                    RMS_EPS,
                 )?;
                 {
                     let w_fn = upload(engine, &lw.hc_attn_fn, &format!("blk.{il}.hc_attn_fn"))?;
                     engine.kernels.matmul.matmul_f16(
                         stream,
-                        LaunchConfig { grid_dim: (MIX_HC as u32, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        buf_as_u16(&w_fn), &b_flat_hc, &mut b_hc_mix,
-                        HC_DIM as u64, MIX_HC as u64, nc as u64,
+                        LaunchConfig {
+                            grid_dim: (MIX_HC as u32, nc as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        buf_as_u16(&w_fn),
+                        &b_flat_hc,
+                        &mut b_hc_mix,
+                        HC_DIM as u64,
+                        MIX_HC as u64,
+                        nc as u64,
                     )?;
                 }
                 {
-                    let w_scale = upload(engine, &lw.hc_attn_scale, &format!("blk.{il}.hc_attn_scale"))?;
-                    let w_base  = upload(engine, &lw.hc_attn_base,  &format!("blk.{il}.hc_attn_base"))?;
-                    let w_norm  = upload(engine, &lw.attn_norm,     &format!("blk.{il}.attn_norm"))?;
+                    let w_scale = upload(
+                        engine,
+                        &lw.hc_attn_scale,
+                        &format!("blk.{il}.hc_attn_scale"),
+                    )?;
+                    let w_base =
+                        upload(engine, &lw.hc_attn_base, &format!("blk.{il}.hc_attn_base"))?;
+                    let w_norm = upload(engine, &lw.attn_norm, &format!("blk.{il}.attn_norm"))?;
                     engine.kernels.hc.hc_split_weighted_sum_norm_fused(
                         stream,
-                        LaunchConfig { grid_dim: (nc as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        &b_hc_mix, buf_as_f32(&w_scale), buf_as_f32(&w_base),
-                        &b_hc, buf_as_f32(&w_norm),
+                        LaunchConfig {
+                            grid_dim: (nc as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &b_hc_mix,
+                        buf_as_f32(&w_scale),
+                        buf_as_f32(&w_base),
+                        &b_hc,
+                        buf_as_f32(&w_norm),
                         b_hc_split.cu_deviceptr() as *mut f32,
-                        &mut b_attn_cur, &mut b_attn_norm,
-                        N_EMBD as u32, N_HC as u32, nc as u32,
-                        N_HC_SINKHORN_ITER as u32, HC_EPS, RMS_EPS,
+                        &mut b_attn_cur,
+                        &mut b_attn_norm,
+                        N_EMBD as u32,
+                        N_HC as u32,
+                        nc as u32,
+                        N_HC_SINKHORN_ITER as u32,
+                        HC_EPS,
+                        RMS_EPS,
                     )?;
                 }
 
                 // ── b. Batch QKV projections ───────────────────────────────────
                 engine.kernels.quantize.quantize_q8_0(
                     stream,
-                    LaunchConfig { grid_dim: (blocks_embd as u32, nc as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
-                    &b_attn_norm, &mut b_xq_i8, &mut b_xscale, N_EMBD as u64, blocks_embd,
+                    LaunchConfig {
+                        grid_dim: (blocks_embd as u32, nc as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &b_attn_norm,
+                    &mut b_xq_i8,
+                    &mut b_xscale,
+                    N_EMBD as u64,
+                    blocks_embd,
                 )?;
                 {
                     let w_qa = upload(engine, &lw.attn_q_a, &format!("blk.{il}.attn_q_a"))?;
                     engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
                         stream,
-                        LaunchConfig { grid_dim: ((Q_RANK as u32 + 7) / 8, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        &w_qa, &b_xq_i8, &b_xscale, &mut b_qr,
-                        N_EMBD as u64, Q_RANK as u64, nc as u64, blocks_embd,
+                        LaunchConfig {
+                            grid_dim: ((Q_RANK as u32 + 7) / 8, nc as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &w_qa,
+                        &b_xq_i8,
+                        &b_xscale,
+                        &mut b_qr,
+                        N_EMBD as u64,
+                        Q_RANK as u64,
+                        nc as u64,
+                        blocks_embd,
                     )?;
                 }
                 {
                     let w_kv = upload(engine, &lw.attn_kv, &format!("blk.{il}.attn_kv_a_mla"))?;
                     engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
                         stream,
-                        LaunchConfig { grid_dim: ((N_HEAD_DIM as u32 + 7) / 8, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        &w_kv, &b_xq_i8, &b_xscale, &mut b_kv_raw,
-                        N_EMBD as u64, N_HEAD_DIM as u64, nc as u64, blocks_embd,
+                        LaunchConfig {
+                            grid_dim: ((N_HEAD_DIM as u32 + 7) / 8, nc as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &w_kv,
+                        &b_xq_i8,
+                        &b_xscale,
+                        &mut b_kv_raw,
+                        N_EMBD as u64,
+                        N_HEAD_DIM as u64,
+                        nc as u64,
+                        blocks_embd,
                     )?;
                 }
                 {
-                    let w_qa_norm = upload(engine, &lw.attn_q_a_norm, &format!("blk.{il}.attn_q_a_norm"))?;
-                    let w_kv_norm = upload(engine, &lw.attn_kv_a_norm, &format!("blk.{il}.attn_kv_a_norm"))?;
+                    let w_qa_norm = upload(
+                        engine,
+                        &lw.attn_q_a_norm,
+                        &format!("blk.{il}.attn_q_a_norm"),
+                    )?;
+                    let w_kv_norm = upload(
+                        engine,
+                        &lw.attn_kv_a_norm,
+                        &format!("blk.{il}.attn_kv_a_norm"),
+                    )?;
                     engine.kernels.norm.dsv4_qkv_rms_norm_rows(
                         stream,
-                        LaunchConfig { grid_dim: (nc as u32, 2, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        &b_qr, buf_as_f32(&w_qa_norm), &mut b_qr_norm, Q_RANK as u32,
-                        &b_kv_raw, buf_as_f32(&w_kv_norm), &mut b_kv, N_HEAD_DIM as u32,
-                        nc as u32, RMS_EPS,
+                        LaunchConfig {
+                            grid_dim: (nc as u32, 2, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &b_qr,
+                        buf_as_f32(&w_qa_norm),
+                        &mut b_qr_norm,
+                        Q_RANK as u32,
+                        &b_kv_raw,
+                        buf_as_f32(&w_kv_norm),
+                        &mut b_kv,
+                        N_HEAD_DIM as u32,
+                        nc as u32,
+                        RMS_EPS,
                     )?;
                 }
                 engine.kernels.quantize.quantize_q8_0(
                     stream,
-                    LaunchConfig { grid_dim: (blocks_qrank as u32, nc as u32, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 },
-                    &b_qr_norm, &mut b_xq_i8, &mut b_xscale, Q_RANK as u64, blocks_qrank,
+                    LaunchConfig {
+                        grid_dim: (blocks_qrank as u32, nc as u32, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &b_qr_norm,
+                    &mut b_xq_i8,
+                    &mut b_xscale,
+                    Q_RANK as u64,
+                    blocks_qrank,
                 )?;
                 {
                     let w_qb = upload(engine, &lw.attn_q_b, &format!("blk.{il}.attn_q_b"))?;
                     engine.kernels.matmul.matmul_q8_0_preq_batch_warp8(
                         stream,
-                        LaunchConfig { grid_dim: ((Q_DIM as u32 + 7) / 8, nc as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        &w_qb, &b_xq_i8, &b_xscale, &mut b_q,
-                        Q_RANK as u64, Q_DIM as u64, nc as u64, blocks_qrank,
+                        LaunchConfig {
+                            grid_dim: ((Q_DIM as u32 + 7) / 8, nc as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &w_qb,
+                        &b_xq_i8,
+                        &b_xscale,
+                        &mut b_q,
+                        Q_RANK as u64,
+                        Q_DIM as u64,
+                        nc as u64,
+                        blocks_qrank,
                     )?;
                 }
                 engine.kernels.norm.head_rms_norm(
                     stream,
-                    LaunchConfig { grid_dim: (nc as u32 * N_HEAD as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                    &mut b_q, nc as u32, N_HEAD as u32, N_HEAD_DIM as u32, RMS_EPS,
+                    LaunchConfig {
+                        grid_dim: (nc as u32 * N_HEAD as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &mut b_q,
+                    nc as u32,
+                    N_HEAD as u32,
+                    N_HEAD_DIM as u32,
+                    RMS_EPS,
                 )?;
-                let fs = rope_freq_scale(il); let fa = rope_attn_factor(il, fs);
+                let fs = rope_freq_scale(il);
+                let fa = rope_attn_factor(il, fs);
                 engine.kernels.rope.rope_tail(
-                    stream, Engine::cfg1d(nc * N_HEAD * (N_ROT / 2), 256),
-                    &mut b_q, nc as u32, N_HEAD as u32, N_HEAD_DIM as u32, N_ROT as u32,
-                    abs_start, ROPE_ORIG_CTX, 0, rope_freq_base(il), fs, rope_ext_factor(il), fa,
-                    ROPE_YARN_BETA_FAST, ROPE_YARN_BETA_SLOW,
+                    stream,
+                    Engine::cfg1d(nc * N_HEAD * (N_ROT / 2), 256),
+                    &mut b_q,
+                    nc as u32,
+                    N_HEAD as u32,
+                    N_HEAD_DIM as u32,
+                    N_ROT as u32,
+                    abs_start,
+                    ROPE_ORIG_CTX,
+                    0,
+                    rope_freq_base(il),
+                    fs,
+                    rope_ext_factor(il),
+                    fa,
+                    ROPE_YARN_BETA_FAST,
+                    ROPE_YARN_BETA_SLOW,
                 )?;
                 engine.kernels.rope.rope_tail(
-                    stream, Engine::cfg1d(nc * N_HEAD_KV * (N_ROT / 2), 256),
-                    &mut b_kv, nc as u32, N_HEAD_KV as u32, N_HEAD_DIM as u32, N_ROT as u32,
-                    abs_start, ROPE_ORIG_CTX, 0, rope_freq_base(il), fs, rope_ext_factor(il), fa,
-                    ROPE_YARN_BETA_FAST, ROPE_YARN_BETA_SLOW,
+                    stream,
+                    Engine::cfg1d(nc * N_HEAD_KV * (N_ROT / 2), 256),
+                    &mut b_kv,
+                    nc as u32,
+                    N_HEAD_KV as u32,
+                    N_HEAD_DIM as u32,
+                    N_ROT as u32,
+                    abs_start,
+                    ROPE_ORIG_CTX,
+                    0,
+                    rope_freq_base(il),
+                    fs,
+                    rope_ext_factor(il),
+                    fa,
+                    ROPE_YARN_BETA_FAST,
+                    ROPE_YARN_BETA_SLOW,
                 )?;
 
                 // ── c. Store KV entries at positions abs_start..abs_start+nc-1 ─
                 engine.kernels.kv_cache.store_raw_kv_batch(
-                    stream, Engine::cfg1d(nc * N_HEAD_DIM, 256),
-                    &b_kv, &mut self.raw_cache[il],
-                    self.raw_cap as u32, abs_start, nc as u32, N_HEAD_DIM as u32,
+                    stream,
+                    Engine::cfg1d(nc * N_HEAD_DIM, 256),
+                    &b_kv,
+                    &mut self.raw_cache[il],
+                    self.raw_cap as u32,
+                    abs_start,
+                    nc as u32,
+                    N_HEAD_DIM as u32,
                 )?;
 
                 // ── d. Batch attention (first fresh chunk only) ─────────────────
                 if batch_attn {
-                    let sinks_buf = upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
+                    let sinks_buf =
+                        upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
                     engine.kernels.attention.prefill_raw(
                         stream,
-                        LaunchConfig { grid_dim: (nc as u32, N_HEAD as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                        &b_q, &self.raw_cache[il], buf_as_f32(&sinks_buf), &mut b_heads,
-                        nc as u32, self.raw_cap as u32, N_HEAD as u32, N_HEAD_DIM as u32,
+                        LaunchConfig {
+                            grid_dim: (nc as u32, N_HEAD as u32, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &b_q,
+                        &self.raw_cache[il],
+                        buf_as_f32(&sinks_buf),
+                        &mut b_heads,
+                        nc as u32,
+                        N_SWA as u32,
+                        N_HEAD as u32,
+                        N_HEAD_DIM as u32,
                     )?;
                 }
 
@@ -649,24 +799,29 @@ impl Session {
                         cuda_core::memory::memcpy_dtod_async(
                             self.cur_hc.cu_deviceptr(),
                             b_hc.cu_deviceptr() + (t * HC_DIM) as u64 * f32_size,
-                            HC_DIM * 4, stream.cu_stream(),
+                            HC_DIM * 4,
+                            stream.cu_stream(),
                         )?;
                         // b_hc_split[t] → self.hc_split
                         cuda_core::memory::memcpy_dtod_async(
                             self.hc_split.cu_deviceptr(),
                             b_hc_split.cu_deviceptr() + (t * MIX_HC) as u64 * f32_size,
-                            MIX_HC * 4, stream.cu_stream(),
+                            MIX_HC * 4,
+                            stream.cu_stream(),
                         )?;
                         // b_attn_norm[t] → self.attn_norm (needed by compressors)
                         cuda_core::memory::memcpy_dtod_async(
                             self.attn_norm.cu_deviceptr(),
                             b_attn_norm.cu_deviceptr() + (t * N_EMBD) as u64 * f32_size,
-                            N_EMBD * 4, stream.cu_stream(),
+                            N_EMBD * 4,
+                            stream.cu_stream(),
                         )?;
                     }
 
                     // Compressors — must run before attention to match decode_layer ordering.
-                    if ratio == 4 { self.run_index_compressor_step(engine, il, pos_t)?; }
+                    if ratio == 4 {
+                        self.run_index_compressor_step(engine, il, pos_t)?;
+                    }
                     self.run_attn_compressor_step(engine, il, pos_t)?;
 
                     // Attention for this token.
@@ -676,7 +831,8 @@ impl Session {
                             cuda_core::memory::memcpy_dtod_async(
                                 self.heads.cu_deviceptr(),
                                 b_heads.cu_deviceptr() + (t * Q_DIM) as u64 * f32_size,
-                                Q_DIM * 4, stream.cu_stream(),
+                                Q_DIM * 4,
+                                stream.cu_stream(),
                             )?;
                         }
                     } else {
@@ -685,24 +841,43 @@ impl Session {
                             cuda_core::memory::memcpy_dtod_async(
                                 self.q.cu_deviceptr(),
                                 b_q.cu_deviceptr() + (t * Q_DIM) as u64 * f32_size,
-                                Q_DIM * 4, stream.cu_stream(),
+                                Q_DIM * 4,
+                                stream.cu_stream(),
                             )?;
                         }
                         let n_comp = if ratio != 0 { self.layer_n_comp[il] } else { 0 };
-                        let n_raw = if pos_t + 1 < self.raw_cap as u32 { pos_t + 1 } else { self.raw_cap as u32 };
+                        let n_raw = if pos_t + 1 < self.raw_cap as u32 {
+                            pos_t + 1
+                        } else {
+                            self.raw_cap as u32
+                        };
                         let raw_start = (pos_t + 1).wrapping_sub(n_raw) % self.raw_cap as u32;
-                        let sinks_buf = upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
+                        let sinks_buf =
+                            upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
                         engine.kernels.attention.decode_mixed(
                             stream,
-                            LaunchConfig { grid_dim: (1, N_HEAD as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                            LaunchConfig {
+                                grid_dim: (1, N_HEAD as u32, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
                             &self.q,
                             &self.raw_cache[il],
                             &self.attn_comp_cache[il],
                             &self.attn_comp_cache[il],
                             buf_as_f32(&sinks_buf),
                             &mut self.heads,
-                            0, 1, pos_t, n_raw, self.raw_cap as u32, raw_start,
-                            n_comp, N_SWA as u32, ratio, N_HEAD as u32, N_HEAD_DIM as u32,
+                            0,
+                            1,
+                            pos_t,
+                            n_raw,
+                            self.raw_cap as u32,
+                            raw_start,
+                            n_comp,
+                            N_SWA as u32,
+                            ratio,
+                            N_HEAD as u32,
+                            N_HEAD_DIM as u32,
                         )?;
                     }
 
@@ -713,7 +888,8 @@ impl Session {
                         cuda_core::memory::memcpy_dtod_async(
                             b_hc_next.cu_deviceptr() + (t * HC_DIM) as u64 * f32_size,
                             self.cur_hc.cu_deviceptr(),
-                            HC_DIM * 4, stream.cu_stream(),
+                            HC_DIM * 4,
+                            stream.cu_stream(),
                         )?;
                     }
                 }
@@ -730,7 +906,10 @@ impl Session {
         self.decode_output(engine, last_pos)?;
         self.n_filled += n;
 
-        let logits = self.logits_buf.to_host_vec(stream).context("prefill: copying logits")?;
+        let logits = self
+            .logits_buf
+            .to_host_vec(stream)
+            .context("prefill: copying logits")?;
         Ok(logits)
     }
 
@@ -1807,7 +1986,7 @@ impl Session {
             }
         }
 
-        // ── h. MoE router + experts (TODO: simplified stub) ──────────────
+        // ── h. MoE router + experts ──────────────────────────────────────
         if lw.ffn_gate_inp.is_some() {
             // router_logits ← ffn_norm × W_ffn_gate_inp  [N_EMBD → N_EXPERT]
             // ffn_gate_inp is F16; use matmul_f16 with raw f32 ffn_norm input.

@@ -75,7 +75,10 @@ fn bos_golden() {
             top1_val >= TOP1_LOGIT_MIN,
             "BOS logit[5]={top1_val:.4} below minimum {TOP1_LOGIT_MIN} (ds4: 16.78)"
         );
-        assert!(top1_val < 22.0, "BOS logit[5]={top1_val:.4} suspiciously high");
+        assert!(
+            top1_val < 22.0,
+            "BOS logit[5]={top1_val:.4} suspiciously high"
+        );
 
         // Rank-1 vs rank-2 gap.
         let sorted = {
@@ -84,11 +87,20 @@ fn bos_golden() {
             s
         };
         let gap = sorted[0] - sorted[1];
-        assert!(gap >= 0.5, "rank-1 vs rank-2 gap={gap:.4} < 0.5 (degenerate)");
+        assert!(
+            gap >= 0.5,
+            "rank-1 vs rank-2 gap={gap:.4} < 0.5 (degenerate)"
+        );
 
         // Second token sanity.
-        assert!(!logits_tok2.iter().any(|v| v.is_nan()), "pos=1 logits contain NaN");
-        assert!(!logits_tok2.iter().any(|v| v.is_infinite()), "pos=1 logits contain inf");
+        assert!(
+            !logits_tok2.iter().any(|v| v.is_nan()),
+            "pos=1 logits contain NaN"
+        );
+        assert!(
+            !logits_tok2.iter().any(|v| v.is_infinite()),
+            "pos=1 logits contain inf"
+        );
         let (_, top1_tok2) = top1(&logits_tok2);
         assert!(
             top1_tok2 > 0.0 && top1_tok2 < 150.0,
@@ -106,7 +118,10 @@ fn bos_golden() {
         assert_eq!(sess.pos(), 1, "pos after prefill([BOS])");
 
         let (top1_idx, top1_val) = top1(&logits);
-        assert_eq!(top1_idx, 5, "prefill([BOS]): top token should be 5, got {top1_idx}");
+        assert_eq!(
+            top1_idx, 5,
+            "prefill([BOS]): top token should be 5, got {top1_idx}"
+        );
         assert_eq!(
             top5(&logits),
             EXPECTED_TOP5,
@@ -132,8 +147,14 @@ fn bos_golden() {
         let logits = sess.prefill(&engine, &prompt).expect("prefill 200 tokens");
         assert_eq!(sess.pos(), 200, "pos after 200-token prefill");
 
-        assert!(!logits.iter().any(|v| v.is_nan()), "200-token prefill logits contain NaN");
-        assert!(!logits.iter().any(|v| v.is_infinite()), "200-token prefill logits contain inf");
+        assert!(
+            !logits.iter().any(|v| v.is_nan()),
+            "200-token prefill logits contain NaN"
+        );
+        assert!(
+            !logits.iter().any(|v| v.is_infinite()),
+            "200-token prefill logits contain inf"
+        );
 
         let (top1_idx, top_val) = top1(&logits);
         assert_eq!(
@@ -150,10 +171,12 @@ fn bos_golden() {
     {
         let mut sess = Session::new(&engine, 512).expect("session alloc");
 
-        sess.prefill(&engine, &[0i32, 5i32]).expect("prefill [BOS, 5]");
+        sess.prefill(&engine, &[0i32, 5i32])
+            .expect("prefill [BOS, 5]");
         assert_eq!(sess.pos(), 2, "pos after prefill([BOS, 5])");
 
-        sess.decode_next(&engine, 1897).expect("decode_next after prefill");
+        sess.decode_next(&engine, 1897)
+            .expect("decode_next after prefill");
         assert_eq!(sess.pos(), 3, "pos after decode_next following prefill");
     }
 }
