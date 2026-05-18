@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 /// Session: allocates GPU scratch buffers and runs single-token decode.
 ///
-/// First-pass implementation: pure sliding-window attention (n_comp=0),
-/// compressor and indexer stubbed out.  Correctness beyond the first N_SWA
-/// tokens is not guaranteed, but the code compiles and runs structurally.
+/// Full implementation: sliding-window attention for ratio=0 layers,
+/// compressed-KV attention for ratio=128 layers, and indexed (top-K) attention
+/// for ratio=4 layers.  Compressor state is populated during both `decode` and
+/// `prefill`.
 use anyhow::{Context, Result};
 use cuda_core::{DeviceBuffer, LaunchConfig};
 
@@ -11,8 +12,8 @@ use crate::engine::Engine;
 use crate::kernels::quantize::{IQ2_SIGNS, IQ2_XXS_GRID};
 use crate::model::{
     N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, N_HC, N_HC_SINKHORN_ITER, N_HEAD, N_HEAD_DIM,
-    N_HEAD_KV, N_LAYER, N_LORA_O, N_LORA_Q, N_OUT_GROUP, N_ROT, N_SWA, N_VALUE_DIM, N_VOCAB, QK_K,
-    TensorMeta,
+    N_HEAD_KV, N_INDEXER_HEAD, N_INDEXER_HEAD_DIM, N_INDEXER_TOP_K, N_LAYER, N_LORA_O, N_LORA_Q,
+    N_OUT_GROUP, N_ROT, N_SWA, N_VALUE_DIM, N_VOCAB, QK_K, TensorMeta,
 };
 
 // ─── Model hyperparameters ───────────────────────────────────────────────────
@@ -34,6 +35,7 @@ const Q_RANK: usize = N_LORA_Q; // 1024
 const Q_DIM: usize = N_HEAD * N_HEAD_DIM; // 32768
 const LOW_DIM: usize = N_OUT_GROUP * N_LORA_O; // 8192
 const GROUP_DIM: usize = N_HEAD_DIM * (N_HEAD / N_OUT_GROUP); // 4096
+const INDEXER_Q_DIM: usize = N_INDEXER_HEAD * N_INDEXER_HEAD_DIM; // 8192
 
 // ─── Layer properties ────────────────────────────────────────────────────────
 fn compress_ratio(il: usize) -> u32 {
@@ -118,6 +120,14 @@ pub struct Session {
     // ── Compressor emit scratch (one emitted row, pre- and post-norm) ────
     comp_emit_pre: DeviceBuffer<f32>, // [N_HEAD_DIM] — pool reduction output
     comp_emit_post: DeviceBuffer<f32>, // [N_HEAD_DIM] — after norm+rope+fp8
+    // ── Indexer compressor emit scratch ───────────────────────────────────────
+    index_comp_emit_pre: DeviceBuffer<f32>, // [N_INDEXER_HEAD_DIM=128]
+    index_comp_emit_post: DeviceBuffer<f32>, // [N_INDEXER_HEAD_DIM]
+    // ── Indexer scratch buffers ───────────────────────────────────────────────
+    indexer_q: DeviceBuffer<f32>,        // [INDEXER_Q_DIM=8192]
+    indexer_weights: DeviceBuffer<f32>,  // [N_INDEXER_HEAD=64]
+    indexer_scores: DeviceBuffer<f32>,   // [comp_cap]
+    indexer_topk_buf: DeviceBuffer<i32>, // [N_INDEXER_TOP_K=512]
     // ── MoE Q8_K scratch ─────────────────────────────────────────────────
     moe_xq: DeviceBuffer<u8>, // Q8_K of ffn_norm: xq_blocks * Q8K_BLOCK_BYTES
     moe_midq: DeviceBuffer<u8>, // Q8_K of routed_mid: N_EXPERT_USED * midq_blocks * Q8K_BLOCK_BYTES
@@ -129,6 +139,10 @@ pub struct Session {
     attn_comp_cache: Vec<DeviceBuffer<f32>>,
     attn_state_kv: Vec<DeviceBuffer<f32>>,
     attn_state_score: Vec<DeviceBuffer<f32>>,
+    // ── Per-layer indexer compressor state (ratio=4 only) ────────────────────
+    index_comp_cache: Vec<DeviceBuffer<f32>>,
+    index_state_kv: Vec<DeviceBuffer<f32>>,
+    index_state_score: Vec<DeviceBuffer<f32>>,
     // ── Per-layer counters ────────────────────────────────────────────────
     layer_n_comp: Vec<u32>,
     // ── Config ────────────────────────────────────────────────────────────
@@ -193,7 +207,6 @@ impl Session {
 
         let raw_cap = N_SWA;
         let comp_cap = ctx_size / 4 + 2;
-        let _index_comp_cap = comp_cap;
 
         // Scalar scratch
         let cur_hc = zbuf!(f32, HC_DIM);
@@ -243,6 +256,14 @@ impl Session {
         let comp_emit_pre = zbuf!(f32, N_HEAD_DIM);
         let comp_emit_post = zbuf!(f32, N_HEAD_DIM);
 
+        // Indexer compressor emit scratch
+        let index_comp_emit_pre = zbuf!(f32, N_INDEXER_HEAD_DIM);
+        let index_comp_emit_post = zbuf!(f32, N_INDEXER_HEAD_DIM);
+        let indexer_q = zbuf!(f32, INDEXER_Q_DIM);
+        let indexer_weights = zbuf!(f32, N_INDEXER_HEAD);
+        let indexer_scores = zbuf!(f32, comp_cap);
+        let indexer_topk_buf = zbuf!(i32, N_INDEXER_TOP_K);
+
         // MoE Q8_K scratch buffers
         const Q8K_BLOCK_BYTES: usize = 292; // f32 d + i8[256] qs + i16[16] bsums
         let xq_blocks = N_EMBD / QK_K; // 16 — Q8_K blocks per ffn_norm row
@@ -261,6 +282,9 @@ impl Session {
         let mut attn_comp_cache = Vec::with_capacity(N_LAYER);
         let mut attn_state_kv = Vec::with_capacity(N_LAYER);
         let mut attn_state_score = Vec::with_capacity(N_LAYER);
+        let mut index_comp_cache = Vec::with_capacity(N_LAYER);
+        let mut index_state_kv = Vec::with_capacity(N_LAYER);
+        let mut index_state_score = Vec::with_capacity(N_LAYER);
 
         for il in 0..N_LAYER {
             // raw cache: circular ring of raw_cap KV rows
@@ -280,6 +304,19 @@ impl Session {
                 attn_comp_cache.push(zbuf!(f32, 1));
                 attn_state_kv.push(zbuf!(f32, 1));
                 attn_state_score.push(zbuf!(f32, 1));
+            }
+
+            // Indexer compressor state (ratio=4 only)
+            if ratio == 4 {
+                index_comp_cache.push(zbuf!(f32, comp_cap * N_INDEXER_HEAD_DIM));
+                let state_rows = 2 * ratio as usize; // coff=2 for ratio=4 → 8 rows
+                let state_width = 2 * N_INDEXER_HEAD_DIM; // 256
+                index_state_kv.push(zbuf!(f32, state_rows * state_width));
+                index_state_score.push(zbuf!(f32, state_rows * state_width));
+            } else {
+                index_comp_cache.push(zbuf!(f32, 1));
+                index_state_kv.push(zbuf!(f32, 1));
+                index_state_score.push(zbuf!(f32, 1));
             }
         }
 
@@ -327,6 +364,12 @@ impl Session {
             attn_low,
             comp_emit_pre,
             comp_emit_post,
+            index_comp_emit_pre,
+            index_comp_emit_post,
+            indexer_q,
+            indexer_weights,
+            indexer_scores,
+            indexer_topk_buf,
             moe_xq,
             moe_midq,
             iq2_grid_gpu,
@@ -335,6 +378,9 @@ impl Session {
             attn_comp_cache,
             attn_state_kv,
             attn_state_score,
+            index_comp_cache,
+            index_state_kv,
+            index_state_score,
             layer_n_comp,
             ctx_size,
             raw_cap,
@@ -714,7 +760,7 @@ impl Session {
                 n as u32,
                 N_HEAD_DIM as u32,
             )?;
-            // (Compressor skipped for prefill; raw cache covers up to N_SWA tokens.)
+            // (Raw KV cache populated above; compressor steps run per-token below.)
 
             // ── d. Batch prefill attention ────────────────────────────────
             {
@@ -774,6 +820,12 @@ impl Session {
                     )?;
                 }
 
+                // Run compressor steps for this position (populates comp caches for future decodes).
+                if ratio == 4 {
+                    self.run_index_compressor_step(engine, il, pos_t)?;
+                }
+                self.run_attn_compressor_step(engine, il, pos_t)?;
+
                 self.decode_attn_out_and_ffn(engine, il, pos_t, ratio, tokens[t])?;
 
                 // self.cur_hc now holds this token's updated HC → store to b_hc_next[t]
@@ -802,6 +854,343 @@ impl Session {
             .to_host_vec(stream)
             .context("prefill: copying logits")?;
         Ok(logits)
+    }
+
+    /// Run one step of the attention compressor for layer `il` at position `pos`.
+    /// Reads `self.attn_norm`; may write to `attn_comp_cache[il]`; increments
+    /// `layer_n_comp[il]` when a row is emitted.
+    fn run_attn_compressor_step(&mut self, engine: &Engine, il: usize, pos: u32) -> Result<()> {
+        let ratio = compress_ratio(il);
+        if ratio == 0 {
+            return Ok(());
+        }
+        let lw = &engine.weights.layers[il];
+        if lw.attn_compressor_kv.is_none() {
+            return Ok(());
+        }
+
+        let stream = &engine.stream;
+        let coff: usize = if ratio == 4 { 2 } else { 1 };
+        let comp_width = (coff * N_HEAD_DIM) as u32;
+
+        // Project attn_norm → comp_kv_cur, comp_sc_cur
+        {
+            let w_kv = upload(
+                engine,
+                &lw.attn_compressor_kv,
+                &format!("blk.{il}.attn_compressor_kv"),
+            )?;
+            let w_gate = upload(
+                engine,
+                &lw.attn_compressor_gate,
+                &format!("blk.{il}.attn_compressor_gate"),
+            )?;
+            engine.kernels.matmul.matmul_f16(
+                stream,
+                LaunchConfig {
+                    grid_dim: (comp_width, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                buf_as_u16(&w_kv),
+                &self.attn_norm,
+                &mut self.comp_kv_cur,
+                N_EMBD as u64,
+                comp_width as u64,
+                1,
+            )?;
+            engine.kernels.matmul.matmul_f16(
+                stream,
+                LaunchConfig {
+                    grid_dim: (comp_width, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                buf_as_u16(&w_gate),
+                &self.attn_norm,
+                &mut self.comp_sc_cur,
+                N_EMBD as u64,
+                comp_width as u64,
+                1,
+            )?;
+        }
+        // Store into state ring with APE positional bias
+        {
+            let w_ape = upload(
+                engine,
+                &lw.attn_compressor_ape,
+                &format!("blk.{il}.attn_compressor_ape"),
+            )?;
+            engine.kernels.hc.compressor_store(
+                stream,
+                Engine::cfg1d(comp_width as usize, 256),
+                &self.comp_kv_cur,
+                &self.comp_sc_cur,
+                &mut self.attn_state_kv[il],
+                &mut self.attn_state_score[il],
+                w_ape.cu_deviceptr() as *const u8,
+                0u64,
+                1u32,
+                N_HEAD_DIM as u32,
+                ratio,
+                pos,
+                1u32,
+            )?;
+        }
+        // Emit a compressed KV row every `ratio` tokens
+        let emit = (pos + 1) % ratio == 0;
+        if emit && self.layer_n_comp[il] < self.comp_cap as u32 {
+            let comp_row = self.layer_n_comp[il];
+
+            engine.kernels.hc.compressor_update_pool(
+                stream,
+                Engine::cfg1d(N_HEAD_DIM, 256),
+                &self.attn_state_kv[il],
+                &self.attn_state_score[il],
+                &mut self.comp_emit_pre,
+                N_HEAD_DIM as u32,
+                ratio,
+            )?;
+            {
+                let w_norm = upload(
+                    engine,
+                    &lw.attn_compressor_norm,
+                    &format!("blk.{il}.attn_compressor_norm"),
+                )?;
+                engine.kernels.norm.rms_norm_weight(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &self.comp_emit_pre,
+                    buf_as_f32(&w_norm),
+                    &mut self.comp_emit_post,
+                    N_HEAD_DIM as u32,
+                    1,
+                    RMS_EPS,
+                )?;
+            }
+            let comp_pos = pos + 1 - ratio;
+            let fs = rope_freq_scale(il);
+            let fa = rope_attn_factor(il, fs);
+            engine.kernels.rope.rope_tail(
+                stream,
+                Engine::cfg1d(N_ROT / 2, 256),
+                &mut self.comp_emit_post,
+                1,
+                1u32,
+                N_HEAD_DIM as u32,
+                N_ROT as u32,
+                comp_pos,
+                ROPE_ORIG_CTX,
+                0,
+                rope_freq_base(il),
+                fs,
+                rope_ext_factor(il),
+                fa,
+                ROPE_YARN_BETA_FAST,
+                ROPE_YARN_BETA_SLOW,
+            )?;
+            engine.kernels.quantize.fp8_kv_quantize(
+                stream,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut self.comp_emit_post,
+                1u32,
+                N_HEAD_DIM as u32,
+                N_ROT as u32,
+            )?;
+            engine.kernels.utils.copy_f32_at_offset(
+                stream,
+                Engine::cfg1d(N_HEAD_DIM, 256),
+                &self.comp_emit_post,
+                &mut self.attn_comp_cache[il],
+                (comp_row as usize * N_HEAD_DIM) as u32,
+            )?;
+            if ratio == 4 {
+                engine.kernels.hc.compressor_shift_ratio4(
+                    stream,
+                    Engine::cfg1d(4 * comp_width as usize, 256),
+                    &mut self.attn_state_kv[il],
+                    &mut self.attn_state_score[il],
+                    comp_width,
+                )?;
+            }
+            self.layer_n_comp[il] += 1;
+        }
+        Ok(())
+    }
+
+    /// Run one step of the indexer compressor for layer `il` at position `pos`.
+    /// Only fires for ratio=4 layers. Uses the same `layer_n_comp[il]` counter
+    /// as the attn compressor (they emit in lockstep); does NOT increment it.
+    fn run_index_compressor_step(&mut self, engine: &Engine, il: usize, pos: u32) -> Result<()> {
+        let ratio = compress_ratio(il);
+        if ratio != 4 {
+            return Ok(());
+        }
+        let lw = &engine.weights.layers[il];
+        if lw.indexer_compressor_kv.is_none() {
+            return Ok(());
+        }
+
+        let stream = &engine.stream;
+        // coff=2 for ratio=4; comp_width = 2 * N_INDEXER_HEAD_DIM = 256
+        let comp_width = (2 * N_INDEXER_HEAD_DIM) as u32;
+
+        // Project attn_norm → comp_kv_cur, comp_sc_cur (reuse attn scratch; smaller size is fine)
+        {
+            let w_kv = upload(
+                engine,
+                &lw.indexer_compressor_kv,
+                &format!("blk.{il}.indexer_compressor_kv"),
+            )?;
+            let w_gate = upload(
+                engine,
+                &lw.indexer_compressor_gate,
+                &format!("blk.{il}.indexer_compressor_gate"),
+            )?;
+            engine.kernels.matmul.matmul_f16(
+                stream,
+                LaunchConfig {
+                    grid_dim: (comp_width, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                buf_as_u16(&w_kv),
+                &self.attn_norm,
+                &mut self.comp_kv_cur,
+                N_EMBD as u64,
+                comp_width as u64,
+                1,
+            )?;
+            engine.kernels.matmul.matmul_f16(
+                stream,
+                LaunchConfig {
+                    grid_dim: (comp_width, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                buf_as_u16(&w_gate),
+                &self.attn_norm,
+                &mut self.comp_sc_cur,
+                N_EMBD as u64,
+                comp_width as u64,
+                1,
+            )?;
+        }
+        {
+            let w_ape = upload(
+                engine,
+                &lw.indexer_compressor_ape,
+                &format!("blk.{il}.indexer_compressor_ape"),
+            )?;
+            engine.kernels.hc.compressor_store(
+                stream,
+                Engine::cfg1d(comp_width as usize, 256),
+                &self.comp_kv_cur,
+                &self.comp_sc_cur,
+                &mut self.index_state_kv[il],
+                &mut self.index_state_score[il],
+                w_ape.cu_deviceptr() as *const u8,
+                0u64,
+                1u32,
+                N_INDEXER_HEAD_DIM as u32,
+                ratio,
+                pos,
+                1u32,
+            )?;
+        }
+        let emit = (pos + 1) % ratio == 0;
+        if emit && self.layer_n_comp[il] < self.comp_cap as u32 {
+            let comp_row = self.layer_n_comp[il];
+
+            engine.kernels.hc.compressor_update_pool(
+                stream,
+                Engine::cfg1d(N_INDEXER_HEAD_DIM, 256),
+                &self.index_state_kv[il],
+                &self.index_state_score[il],
+                &mut self.index_comp_emit_pre,
+                N_INDEXER_HEAD_DIM as u32,
+                ratio,
+            )?;
+            {
+                let w_norm = upload(
+                    engine,
+                    &lw.indexer_compressor_norm,
+                    &format!("blk.{il}.indexer_compressor_norm"),
+                )?;
+                engine.kernels.norm.rms_norm_weight(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &self.index_comp_emit_pre,
+                    buf_as_f32(&w_norm),
+                    &mut self.index_comp_emit_post,
+                    N_INDEXER_HEAD_DIM as u32,
+                    1,
+                    RMS_EPS,
+                )?;
+            }
+            let comp_pos = pos + 1 - ratio;
+            let fs = rope_freq_scale(il);
+            let fa = rope_attn_factor(il, fs);
+            engine.kernels.rope.rope_tail(
+                stream,
+                Engine::cfg1d(N_ROT / 2, 256),
+                &mut self.index_comp_emit_post,
+                1,
+                1u32,
+                N_INDEXER_HEAD_DIM as u32,
+                N_ROT as u32,
+                comp_pos,
+                ROPE_ORIG_CTX,
+                0,
+                rope_freq_base(il),
+                fs,
+                rope_ext_factor(il),
+                fa,
+                ROPE_YARN_BETA_FAST,
+                ROPE_YARN_BETA_SLOW,
+            )?;
+            engine.kernels.quantize.fp8_kv_quantize(
+                stream,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut self.index_comp_emit_post,
+                1u32,
+                N_INDEXER_HEAD_DIM as u32,
+                N_ROT as u32,
+            )?;
+            engine.kernels.utils.copy_f32_at_offset(
+                stream,
+                Engine::cfg1d(N_INDEXER_HEAD_DIM, 256),
+                &self.index_comp_emit_post,
+                &mut self.index_comp_cache[il],
+                (comp_row as usize * N_INDEXER_HEAD_DIM) as u32,
+            )?;
+            // ratio=4 always needs a state ring shift
+            engine.kernels.hc.compressor_shift_ratio4(
+                stream,
+                Engine::cfg1d(4 * comp_width as usize, 256),
+                &mut self.index_state_kv[il],
+                &mut self.index_state_score[il],
+                comp_width,
+            )?;
+            // NOTE: do NOT increment layer_n_comp here; run_attn_compressor_step does it
+        }
+        Ok(())
     }
 
     // ─── Per-layer decode ─────────────────────────────────────────────────────
@@ -1066,227 +1455,176 @@ impl Session {
             N_HEAD_DIM as u32,
         )?;
 
-        // ── c. Compressor update ─────────────────────────────────────────
-        // For compressed layers (ratio != 0): project attn_norm → comp state,
-        // store into the running state ring, and emit a compressed KV row every
-        // `ratio` tokens.  Only ratio=128 layers currently use the comp rows for
-        // attention (ratio=4 needs the indexer, skipped until indexer is ported).
-        if ratio != 0 && lw.attn_compressor_kv.is_some() {
-            let coff: usize = if ratio == 4 { 2 } else { 1 };
-            let comp_width = (coff * N_HEAD_DIM) as u32;
-
-            // Project attn_norm → comp_kv_cur, comp_sc_cur  [N_EMBD → comp_width]
-            {
-                let w_kv = upload(
-                    engine,
-                    &lw.attn_compressor_kv,
-                    &format!("blk.{il}.attn_compressor_kv"),
-                )?;
-                let w_gate = upload(
-                    engine,
-                    &lw.attn_compressor_gate,
-                    &format!("blk.{il}.attn_compressor_gate"),
-                )?;
-                engine.kernels.matmul.matmul_f16(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (comp_width, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    buf_as_u16(&w_kv),
-                    &self.attn_norm,
-                    &mut self.comp_kv_cur,
-                    N_EMBD as u64,
-                    comp_width as u64,
-                    1,
-                )?;
-                engine.kernels.matmul.matmul_f16(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (comp_width, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    buf_as_u16(&w_gate),
-                    &self.attn_norm,
-                    &mut self.comp_sc_cur,
-                    N_EMBD as u64,
-                    comp_width as u64,
-                    1,
-                )?;
-            }
-
-            // Store into state ring with APE positional bias.
-            // APE tensor is F16 (ape_type=1), shape [comp_width × ratio].
-            {
-                let w_ape = upload(
-                    engine,
-                    &lw.attn_compressor_ape,
-                    &format!("blk.{il}.attn_compressor_ape"),
-                )?;
-                let n = comp_width as usize; // n_tokens * width = 1 * comp_width
-                engine.kernels.hc.compressor_store(
-                    stream,
-                    Engine::cfg1d(n, 256),
-                    &self.comp_kv_cur,
-                    &self.comp_sc_cur,
-                    &mut self.attn_state_kv[il],
-                    &mut self.attn_state_score[il],
-                    w_ape.cu_deviceptr() as *const u8,
-                    0u64, // ape_offset = 0 (start of the uploaded buffer)
-                    1u32, // ape_type = 1 (F16)
-                    N_HEAD_DIM as u32,
-                    ratio,
-                    pos,
-                    1u32, // n_tokens
-                )?;
-            }
-
-            // Emit a compressed KV row every `ratio` tokens.
-            let emit = (pos + 1) % ratio == 0;
-            if emit && self.layer_n_comp[il] < self.comp_cap as u32 {
-                let comp_row = self.layer_n_comp[il];
-
-                // Pool reduction: state → comp_emit_pre  [N_HEAD_DIM]
-                engine.kernels.hc.compressor_update_pool(
-                    stream,
-                    Engine::cfg1d(N_HEAD_DIM, 256),
-                    &self.attn_state_kv[il],
-                    &self.attn_state_score[il],
-                    &mut self.comp_emit_pre,
-                    N_HEAD_DIM as u32,
-                    ratio,
-                )?;
-
-                // RMS-norm the emitted row with W_comp_norm: comp_emit_pre → comp_emit_post
-                {
-                    let w_norm = upload(
-                        engine,
-                        &lw.attn_compressor_norm,
-                        &format!("blk.{il}.attn_compressor_norm"),
-                    )?;
-                    engine.kernels.norm.rms_norm_weight(
-                        stream,
-                        LaunchConfig {
-                            grid_dim: (1, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        &self.comp_emit_pre,
-                        buf_as_f32(&w_norm),
-                        &mut self.comp_emit_post,
-                        N_HEAD_DIM as u32,
-                        1,
-                        RMS_EPS,
-                    )?;
-                }
-
-                // RoPE: position = (pos + 1 - ratio) for the compressed token
-                let comp_pos = pos + 1 - ratio;
-                let fs = rope_freq_scale(il);
-                let fa = rope_attn_factor(il, fs);
-                engine.kernels.rope.rope_tail(
-                    stream,
-                    Engine::cfg1d(1 * (N_ROT / 2), 256),
-                    &mut self.comp_emit_post,
-                    1,
-                    1u32, // n_head_kv = 1
-                    N_HEAD_DIM as u32,
-                    N_ROT as u32,
-                    comp_pos,
-                    ROPE_ORIG_CTX,
-                    0, // not inverse
-                    rope_freq_base(il),
-                    fs,
-                    rope_ext_factor(il),
-                    fa,
-                    ROPE_YARN_BETA_FAST,
-                    ROPE_YARN_BETA_SLOW,
-                )?;
-
-                // FP8 quantize in-place (nope dims only)
-                engine.kernels.quantize.fp8_kv_quantize(
-                    stream,
-                    LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (64, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &mut self.comp_emit_post,
-                    1u32,
-                    N_HEAD_DIM as u32,
-                    N_ROT as u32,
-                )?;
-
-                // Copy comp_emit_post → attn_comp_cache[il][comp_row * N_HEAD_DIM ..]
-                engine.kernels.utils.copy_f32_at_offset(
-                    stream,
-                    Engine::cfg1d(N_HEAD_DIM, 256),
-                    &self.comp_emit_post,
-                    &mut self.attn_comp_cache[il],
-                    (comp_row as usize * N_HEAD_DIM) as u32,
-                )?;
-
-                // For ratio=4: shift state ring so the top half becomes the bottom half.
-                if ratio == 4 {
-                    engine.kernels.hc.compressor_shift_ratio4(
-                        stream,
-                        Engine::cfg1d(4 * comp_width as usize, 256),
-                        &mut self.attn_state_kv[il],
-                        &mut self.attn_state_score[il],
-                        comp_width,
-                    )?;
-                }
-
-                self.layer_n_comp[il] += 1;
-            }
+        // ── b2. Indexer Q and weights (ratio=4 layers only) ──────────────────
+        if ratio == 4 && lw.indexer_attn_q_b.is_some() {
+            // indexer_q ← qr_norm × W_indexer_q_b  [Q_RANK → INDEXER_Q_DIM]
+            // Note: xq_i8/xscale still hold quantized qr_norm from step b
+            let w_iqb = upload(
+                engine,
+                &lw.indexer_attn_q_b,
+                &format!("blk.{il}.indexer.attn_q_b"),
+            )?;
+            engine.kernels.matmul.matmul_f16(
+                stream,
+                LaunchConfig {
+                    grid_dim: (INDEXER_Q_DIM as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                buf_as_u16(&w_iqb),
+                &self.qr_norm,
+                &mut self.indexer_q,
+                Q_RANK as u64,
+                INDEXER_Q_DIM as u64,
+                1,
+            )?;
+            let fs = rope_freq_scale(il);
+            let fa = rope_attn_factor(il, fs);
+            engine.kernels.rope.rope_tail(
+                stream,
+                Engine::cfg1d(N_INDEXER_HEAD * (N_ROT / 2), 256),
+                &mut self.indexer_q,
+                1,
+                N_INDEXER_HEAD as u32,
+                N_INDEXER_HEAD_DIM as u32,
+                N_ROT as u32,
+                pos,
+                ROPE_ORIG_CTX,
+                0,
+                rope_freq_base(il),
+                fs,
+                rope_ext_factor(il),
+                fa,
+                ROPE_YARN_BETA_FAST,
+                ROPE_YARN_BETA_SLOW,
+            )?;
+            // indexer_weights ← attn_cur × W_indexer_proj  [N_EMBD → N_INDEXER_HEAD]
+            let w_iproj = upload(engine, &lw.indexer_proj, &format!("blk.{il}.indexer.proj"))?;
+            engine.kernels.matmul.matmul_f16(
+                stream,
+                LaunchConfig {
+                    grid_dim: (N_INDEXER_HEAD as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                buf_as_u16(&w_iproj),
+                &self.attn_cur,
+                &mut self.indexer_weights,
+                N_EMBD as u64,
+                N_INDEXER_HEAD as u64,
+                1,
+            )?;
         }
+
+        // ── c. Compressor update ─────────────────────────────────────────
+        // index compressor must run BEFORE attn compressor so both use the same
+        // layer_n_comp value before the attn step increments it.
+        if ratio == 4 {
+            self.run_index_compressor_step(engine, il, pos)?;
+        }
+        self.run_attn_compressor_step(engine, il, pos)?;
 
         // ── d. Attention ─────────────────────────────────────────────────
         {
             let sinks_buf = upload(engine, &lw.attn_sinks, &format!("blk.{il}.attn_sinks"))?;
-            // How many raw rows are in the ring so far?
             let n_raw = if pos + 1 < self.raw_cap as u32 {
                 pos + 1
             } else {
                 self.raw_cap as u32
             };
             let raw_start = (pos + 1).wrapping_sub(n_raw) % self.raw_cap as u32;
-            // Use compressed KV for ratio=128 layers (static attention, all entries).
-            // Ratio=4 layers need the indexer (not yet ported) so we skip comp there.
-            let n_comp = if ratio == 128 {
-                self.layer_n_comp[il]
-            } else {
-                0
-            };
+            let n_comp = if ratio != 0 { self.layer_n_comp[il] } else { 0 };
 
-            engine.kernels.attention.decode_mixed(
-                stream,
-                // Grid: (n_tokens=1, n_head=N_HEAD, 1) × block 256
-                LaunchConfig {
-                    grid_dim: (1, N_HEAD as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &self.q,
-                &self.raw_cache[il],
-                &self.attn_comp_cache[il], // empty (n_comp=0)
-                &self.attn_comp_cache[il], // comp_mask — unused when use_comp_mask=0
-                buf_as_f32(&sinks_buf),
-                &mut self.heads,
-                0,   // use_comp_mask = 0
-                1,   // n_tokens
-                pos, // pos0
-                n_raw,
-                self.raw_cap as u32,
-                raw_start,
-                n_comp,
-                N_SWA as u32, // window
-                ratio,
-                N_HEAD as u32,
-                N_HEAD_DIM as u32,
-            )?;
+            if ratio == 4 && n_comp as usize > N_INDEXER_TOP_K && lw.indexer_attn_q_b.is_some() {
+                // Score every index-comp row, select top-K, then indexed attention.
+                let scale = 1.0_f32 / ((N_INDEXER_HEAD_DIM * N_INDEXER_HEAD) as f32).sqrt();
+                engine.kernels.indexer.indexer_score_one_direct(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (n_comp, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &self.indexer_q,
+                    &self.indexer_weights,
+                    &self.index_comp_cache[il],
+                    &mut self.indexer_scores,
+                    n_comp,
+                    pos,
+                    4,
+                    scale,
+                    1,
+                )?;
+                let n_sort = n_comp.next_power_of_two();
+                engine.kernels.indexer.indexer_topk_bitonic(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: (n_sort * 8) as u32,
+                    },
+                    &self.indexer_scores,
+                    self.indexer_topk_buf.cu_deviceptr() as *mut u32,
+                    n_comp,
+                    1,
+                    N_INDEXER_TOP_K as u32,
+                    n_sort,
+                )?;
+                engine.kernels.attention.indexed_mixed(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (1, N_HEAD as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &self.q,
+                    &self.raw_cache[il],
+                    &self.attn_comp_cache[il],
+                    &self.indexer_topk_buf,
+                    buf_as_f32(&sinks_buf),
+                    &mut self.heads,
+                    1,
+                    pos,
+                    n_raw,
+                    self.raw_cap as u32,
+                    raw_start,
+                    n_comp,
+                    N_INDEXER_TOP_K as u32,
+                    N_SWA as u32,
+                    4,
+                    N_HEAD as u32,
+                    N_HEAD_DIM as u32,
+                )?;
+            } else {
+                // ratio=0: n_comp=0 (SWA only)
+                // ratio=4, n_comp≤top_k: all comp rows visible (no indexer needed)
+                // ratio=128: all comp rows (static attention)
+                engine.kernels.attention.decode_mixed(
+                    stream,
+                    LaunchConfig {
+                        grid_dim: (1, N_HEAD as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &self.q,
+                    &self.raw_cache[il],
+                    &self.attn_comp_cache[il],
+                    &self.attn_comp_cache[il],
+                    buf_as_f32(&sinks_buf),
+                    &mut self.heads,
+                    0,
+                    1,
+                    pos,
+                    n_raw,
+                    self.raw_cap as u32,
+                    raw_start,
+                    n_comp,
+                    N_SWA as u32,
+                    ratio,
+                    N_HEAD as u32,
+                    N_HEAD_DIM as u32,
+                )?;
+            }
         }
 
         // ── e-i. Attention output + FFN (extracted so prefill can call it per-token)
