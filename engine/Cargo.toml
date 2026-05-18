@@ -1,0 +1,17 @@
+[package]
+name = "deepseek-engine"
+version = "0.1.0"
+edition = "2024"
+description = "DeepSeek V4 Flash inference engine — Rust/CUDA port of ds4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[dependencies]
+regex = "1"
+cuda-device = { path = "/srv/data/work/cuda-oxide/crates/cuda-device" }
+cuda-host   = { path = "/srv/data/work/cuda-oxide/crates/cuda-host" }
+cuda-core   = { path = "/srv/data/work/cuda-oxide/crates/cuda-core" }
+half        = { version = "2.4", default-features = false }
+memmap2     = "0.9"
+anyhow      = "1"

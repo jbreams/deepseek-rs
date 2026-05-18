@@ -1,0 +1,14 @@
+[package]
+name = "deepseek-chat"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive multi-turn chat CLI for DeepSeek V4 Flash"
+
+[[bin]]
+name = "deepseek-chat"
+path = "src/main.rs"
+
+[dependencies]
+deepseek-engine = { path = "../engine" }
+rustyline = "14"
+anyhow = "1"
